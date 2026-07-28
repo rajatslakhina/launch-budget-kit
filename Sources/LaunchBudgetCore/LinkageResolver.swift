@@ -148,7 +148,9 @@ public struct LinkageResolver: Sendable {
 
     /// Resolve the graph.
     ///
-    /// Four sweeps, O(V + E + |answer|) in total:
+    /// Four sweeps, O(V + E·I) in total, where I is the number of dynamic images
+    /// (the per-edge set union). I is exactly what the policy ceiling caps, so this is
+    /// linear in edges for any graph the policy would accept:
     ///
     /// 1. Seed every module with its declared linkage.
     /// 2. One **reverse** topological sweep — dependents before dependencies — that
