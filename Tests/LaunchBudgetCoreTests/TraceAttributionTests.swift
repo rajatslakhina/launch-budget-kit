@@ -109,17 +109,18 @@ final class TraceAttributionTests: XCTestCase {
 
     // MARK: Phase split
 
-    func testSelfTimeIsSplitByPhase() {
+    func testSelfTimeIsSplitByPhase() throws {
         let subject = trace([
             .init(["A"], phase: .preMain, count: 4),
             .init(["A"], phase: .preFirstFrame, count: 6),
             .init(["A"], phase: .postFirstFrame, count: 10)
         ])
-        let entry = try? XCTUnwrap(subject.attribution()[ModuleID("A")])
-        XCTAssertEqual(entry?.selfMilliseconds(in: .preMain), 4)
-        XCTAssertEqual(entry?.selfMilliseconds(in: .preFirstFrame), 6)
-        XCTAssertEqual(entry?.selfMilliseconds(in: .postFirstFrame), 10)
-        XCTAssertEqual(entry?.selfMilliseconds, 20)
+        let entry = try XCTUnwrap(subject.attribution()[ModuleID("A")])
+        XCTAssertEqual(entry.selfMilliseconds(in: .preMain), 4)
+        XCTAssertEqual(entry.selfMilliseconds(in: .preFirstFrame), 6)
+        XCTAssertEqual(entry.selfMilliseconds(in: .postFirstFrame), 10)
+        XCTAssertEqual(entry.selfMilliseconds, 20)
+        XCTAssertEqual(entry.launchWindowSelfMilliseconds, 10, "the launch window excludes post-first-frame work")
     }
 
     func testTimeToFirstFrameExcludesPostFirstFrameWork() {

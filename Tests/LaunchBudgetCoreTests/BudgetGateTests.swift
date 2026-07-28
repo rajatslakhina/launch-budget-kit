@@ -103,7 +103,7 @@ final class BudgetGateTests: XCTestCase {
     }
 
     func testBudgetBreachIsReportedPerPhase() throws {
-        // Analytics declares a 1 ms pre-main budget and spends 11 ms in the candidate.
+        // Analytics declares a 3 ms pre-main budget and spends 11 ms in the candidate.
         let report = BudgetGate(policy: .default).evaluate(
             baseline: SampleWorkspace.baselineTrace,
             candidate: SampleWorkspace.regressedCandidateTrace,
