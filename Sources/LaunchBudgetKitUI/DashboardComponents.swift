@@ -50,7 +50,9 @@ extension LinkagePolicy {
 struct DashboardSection<Content: View>: View {
     let title: String
     let subtitle: String?
-    @ViewBuilder var content: Content
+    // No `@ViewBuilder` here: the explicit init below suppresses the memberwise
+    // initialiser the attribute would apply to, so it would be a silent no-op.
+    let content: Content
 
     init(_ title: String, subtitle: String? = nil, @ViewBuilder content: () -> Content) {
         self.title = title
@@ -101,7 +103,9 @@ struct StackedBar: View {
         GeometryReader { proxy in
             let width = max(0, proxy.size.width)
             let totalValue = total
-            HStack(spacing: 1) {
+            // spacing: 0 — the segment widths already sum to exactly `width`, so any
+            // spacing overflows the container (the clipShape was hiding it).
+            HStack(spacing: 0) {
                 if totalValue > 0 {
                     ForEach(segments) { segment in
                         let fraction = max(0, segment.value) / totalValue
@@ -211,7 +215,6 @@ struct CriticalPathRow: View {
     let item: StartupWorkItem
     let isDeferred: Bool
     let isDeferrable: Bool
-    let blockedReason: String?
     let onToggle: () -> Void
 
     var body: some View {
@@ -231,12 +234,6 @@ struct CriticalPathRow: View {
                     Text(item.summary)
                         .font(.caption2)
                         .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                if let blockedReason {
-                    Text(blockedReason)
-                        .font(.caption2)
-                        .foregroundStyle(.orange)
                         .fixedSize(horizontal: false, vertical: true)
                 }
             }
@@ -263,6 +260,37 @@ struct CriticalPathRow: View {
             }
         }
         .padding(.vertical, 4)
+    }
+}
+
+// MARK: - Attribution row
+
+struct AttributionRow: View {
+    let entry: ModuleAttribution
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Text(entry.module.rawValue)
+                .font(.caption.weight(.medium))
+                .lineLimit(1)
+                .minimumScaleFactor(0.7)
+
+            Spacer(minLength: 4)
+
+            VStack(alignment: .trailing, spacing: 1) {
+                Text("self " + Milliseconds.format(entry.selfMilliseconds) + " ms")
+                    .font(.caption2.monospacedDigit())
+                Text("total " + Milliseconds.format(entry.totalMilliseconds) + " ms")
+                    .font(.system(size: 9).monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+
+            Text(Milliseconds.format(entry.launchWindowSelfMilliseconds) + " ms in launch")
+                .font(.system(size: 9))
+                .foregroundStyle(entry.launchWindowSelfMilliseconds > 0 ? Color.orange : Color.secondary)
+                .frame(width: 84, alignment: .trailing)
+        }
+        .padding(.vertical, 3)
     }
 }
 

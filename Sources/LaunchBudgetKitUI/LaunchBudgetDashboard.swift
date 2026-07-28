@@ -83,6 +83,21 @@ public struct LaunchBudgetDashboard: View {
 
     // MARK: Derived state
 
+    /// Everything the body needs, derived exactly once per pass.
+    ///
+    /// `graph`, `plan`, `schedule` and `report` used to be four separate computed
+    /// properties, so a single `body` pass rebuilt and re-validated the startup
+    /// schedule three times and ran the linkage resolver twice. Harmless at this data
+    /// size — and a bad look in a project whose entire subject is not doing redundant
+    /// work at startup.
+    private struct Snapshot {
+        let graph: ModuleGraph
+        let plan: LinkagePlan
+        let schedule: StartupSchedule
+        let report: GateReport
+        let attribution: [ModuleAttribution]
+    }
+
     /// The validated manifest. Optional all the way through rather than force-tried:
     /// a demo that crashes because a sample manifest was edited is a bad advert for a
     /// library whose entire pitch is "catch this in CI, not at runtime".
@@ -106,19 +121,26 @@ public struct LaunchBudgetDashboard: View {
         try? StartupSchedule(items: scheduleItems)
     }
 
-    private var report: GateReport? {
-        guard let graph else { return nil }
-        return BudgetGate(policy: .default).evaluate(
+    private var snapshot: Snapshot? {
+        guard let graph, let schedule else { return nil }
+        let candidate = candidateChoice.trace
+        let report = BudgetGate(policy: .default).evaluate(
             baseline: SampleWorkspace.baselineTrace,
-            candidate: candidateChoice.trace,
+            candidate: candidate,
             graph: graph,
             schedule: schedule,
             costModel: costModelChoice.model
         )
-    }
-
-    private var plan: LinkagePlan? {
-        graph.map { LinkageResolver().resolve($0) }
+        return Snapshot(
+            graph: graph,
+            // Read off the report rather than resolving again. `BudgetGate` already ran
+            // the resolver on this exact graph; running it a second time here is the
+            // redundant work this whole type exists to remove.
+            plan: report.linkagePlan,
+            schedule: schedule,
+            report: report,
+            attribution: candidate.rankedByLaunchWindow()
+        )
     }
 
     // MARK: Body
@@ -127,14 +149,15 @@ public struct LaunchBudgetDashboard: View {
         NavigationStack {
             ScrollView {
                 VStack(spacing: 14) {
-                    if let report, let plan, let graph {
-                        verdictSection(report)
+                    if let snapshot {
+                        verdictSection(snapshot.report)
                         controlsSection()
-                        preMainSection(report, plan: plan)
-                        linkageSection(graph: graph, plan: plan)
-                        criticalPathSection()
-                        findingsSection(report)
-                        consoleSection(report)
+                        preMainSection(snapshot.report, plan: snapshot.plan)
+                        linkageSection(graph: snapshot.graph, plan: snapshot.plan)
+                        criticalPathSection(snapshot.schedule)
+                        attributionSection(snapshot.attribution)
+                        findingsSection(snapshot.report)
+                        consoleSection(snapshot.report)
                     } else {
                         // Reachable only if the bundled manifest is invalid. Shown as
                         // a real state rather than an empty screen.
@@ -149,7 +172,15 @@ public struct LaunchBudgetDashboard: View {
                 .padding(14)
             }
             .navigationTitle("Launch Budget")
+            // `navigationBarTitleDisplayMode` is `@available(macOS, unavailable)`, and
+            // `canImport(SwiftUI)` is true on macOS — so without this guard the package
+            // would fail to build on a Mac while passing on Linux (where this whole
+            // target compiles to an empty module). Platform-guarded rather than dropped,
+            // because the inline title is what keeps the dense dashboard readable on a
+            // phone.
+            #if os(iOS)
             .navigationBarTitleDisplayMode(.inline)
+            #endif
             .alert(
                 "Can't defer that",
                 isPresented: Binding(
@@ -271,38 +302,73 @@ public struct LaunchBudgetDashboard: View {
         }
     }
 
-    private func criticalPathSection() -> some View {
-        let analysis = schedule?.criticalPath()
-        let onPath = Set(analysis?.path ?? [])
+    private func criticalPathSection(_ schedule: StartupSchedule) -> some View {
+        // Takes the already-validated schedule from the snapshot rather than
+        // rebuilding it: recomputing `scheduleItems`, re-running phase-inversion
+        // validation and re-running the topological sort on every body pass is
+        // precisely the pattern this project is about not doing.
+        let analysis = schedule.criticalPath()
+        let onPath = Set(analysis.path)
         return DashboardSection(
             "Critical path",
-            subtitle: analysis.map {
-                String(
-                    format: "%.1f ms over %d items. Serial total would be %.1f ms, so %.1f ms is already overlapped. "
-                        + "Shortening anything off this path changes nothing.",
-                    $0.durationMilliseconds, $0.path.count, $0.serialMilliseconds, $0.concurrencyHeadroomMilliseconds
-                )
-            } ?? "Schedule is invalid."
+            subtitle: String(
+                format: "%.1f ms over %ld items. Serial total would be %.1f ms, so %.1f ms is already overlapped. "
+                    + "Shortening anything off this path changes nothing.",
+                analysis.durationMilliseconds, analysis.path.count,
+                analysis.serialMilliseconds, analysis.concurrencyHeadroomMilliseconds
+            )
         ) {
             VStack(spacing: 0) {
-                ForEach(scheduleItems.filter { onPath.contains($0.id) || deferredItems.contains($0.id) }, id: \.id) { item in
+                ForEach(schedule.orderedItems.filter { onPath.contains($0.id) || deferredItems.contains($0.id) }, id: \.id) { item in
                     CriticalPathRow(
                         item: item,
                         isDeferred: deferredItems.contains(item.id),
                         isDeferrable: item.phase != .preMain,
-                        blockedReason: nil,
                         onToggle: { toggleDeferral(of: item.id) }
                     )
                     Divider().opacity(0.3)
                 }
 
-                if let analysis, let heaviest = analysis.heaviestOwner {
+                if let heaviest = analysis.heaviestOwner {
                     Text("Heaviest owner on the path: \(heaviest.module.rawValue) — "
                          + "\(Milliseconds.format(heaviest.milliseconds)) ms")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(.top, 8)
+                }
+            }
+        }
+    }
+
+    /// Per-module trace attribution — the fourth layer, and the one that turns
+    /// "launch got slower" into "this team's module got slower".
+    private func attributionSection(_ ranked: [ModuleAttribution]) -> some View {
+        DashboardSection(
+            "Trace attribution",
+            subtitle: "Ranked by cost inside the launch window, not by whole-trace self time — deferred "
+                + "work is not a launch cost. Self time is charged to the top of the stack only; total time "
+                + "to every distinct module in it, once per sample even for re-entrant stacks."
+        ) {
+            VStack(spacing: 0) {
+                if ranked.isEmpty {
+                    Text("No attributable samples in this trace.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                } else {
+                    // `ranked` is already in hand — indexing it directly is safe
+                    // because the indices come from `ranked.indices`. Calling the
+                    // bounds-checked `rankedAttribution(at:)` here instead would
+                    // re-materialise the trace and re-run the whole attribution once
+                    // per row, which is the redundant work the `Snapshot` above exists
+                    // to remove. (That accessor is for callers holding an index whose
+                    // provenance they don't control; it is exercised in
+                    // `TraceAttributionTests`.)
+                    ForEach(Array(ranked.indices.prefix(8)), id: \.self) { index in
+                        AttributionRow(entry: ranked[index])
+                        Divider().opacity(0.3)
+                    }
                 }
             }
         }
