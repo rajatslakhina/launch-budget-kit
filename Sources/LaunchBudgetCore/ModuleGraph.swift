@@ -35,6 +35,20 @@ public struct ModuleID: Hashable, Codable, Sendable, CustomStringConvertible, Ex
     }
 
     public var description: String { rawValue }
+
+    // Single-value coding, so a trace file reads `["dyld", "Analytics"]` rather than
+    // `[{"rawValue":"dyld"}, …]`. Trace JSON is meant to be hand-writable and
+    // diffable in a PR; a wrapper object per stack frame would triple its size and
+    // make it unreadable, which would quietly discourage the exact workflow the
+    // README recommends.
+    public init(from decoder: Decoder) throws {
+        self.rawValue = try decoder.singleValueContainer().decode(String.self)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
 }
 
 // MARK: - Linkage
@@ -87,6 +101,21 @@ public struct LaunchBudget: Codable, Sendable, Equatable {
         // downstream, so clamp at construction rather than defending at every use site.
         self.preMainMilliseconds = max(0, preMainMilliseconds)
         self.firstFrameMilliseconds = max(0, firstFrameMilliseconds)
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case preMainMilliseconds, firstFrameMilliseconds
+    }
+
+    /// Same reasoning as `LaunchTrace.init(from:)`: the synthesised decoder would
+    /// bypass the clamp above, so a manifest with a negative budget would decode into
+    /// a budget that inverts every comparison downstream.
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(
+            preMainMilliseconds: try container.decode(Double.self, forKey: .preMainMilliseconds),
+            firstFrameMilliseconds: try container.decode(Double.self, forKey: .firstFrameMilliseconds)
+        )
     }
 
     public var totalMilliseconds: Double {
@@ -188,6 +217,16 @@ public struct ModuleGraph: Sendable {
     /// Computed once at construction because three separate algorithms need it.
     public let topologicalOrder: [ModuleID]
 
+    /// Reverse adjacency: for each module, the set of modules that directly depend on it.
+    ///
+    /// Built once, in `init`, in a single O(V+E) pass. This is not a micro-optimisation.
+    /// `LinkageResolver` walks *dependents* transitively, once per mergeable module and
+    /// once per static module; when `dependents(of:)` was a full scan of the module
+    /// table, that composition was Θ(V³) — around 4×10⁹ dictionary scans on the same
+    /// 2,000-module chain this package already has a test for. A library that argues
+    /// about CI cost has no business hanging CI.
+    public let dependentsIndex: [ModuleID: Set<ModuleID>]
+
     public init(modules: [ModuleDescriptor]) throws {
         guard !modules.isEmpty else { throw ModuleGraphError.emptyGraph }
 
@@ -209,7 +248,16 @@ public struct ModuleGraph: Sendable {
             }
         }
 
+        var reverse: [ModuleID: Set<ModuleID>] = [:]
+        reverse.reserveCapacity(modules.count)
+        for module in modules {
+            for dependency in module.dependencies {
+                reverse[dependency, default: []].insert(module.id)
+            }
+        }
+
         self.modules = table
+        self.dependentsIndex = reverse
         self.topologicalOrder = try ModuleGraph.topologicallySort(table)
     }
 
@@ -227,13 +275,9 @@ public struct ModuleGraph: Sendable {
         modules[id]
     }
 
-    /// The set of modules that directly depend on `id`.
+    /// The set of modules that directly depend on `id`. O(1).
     public func dependents(of id: ModuleID) -> Set<ModuleID> {
-        var result: Set<ModuleID> = []
-        for (candidateID, descriptor) in modules where descriptor.dependencies.contains(id) {
-            result.insert(candidateID)
-        }
-        return result
+        dependentsIndex[id] ?? []
     }
 
     /// The transitive closure of `id`'s dependencies, excluding `id` itself.

@@ -73,6 +73,18 @@ public struct ModuleAttribution: Sendable, Equatable {
     public func selfMilliseconds(in phase: LaunchPhase) -> Double {
         selfMillisecondsByPhase[phase] ?? 0
     }
+
+    /// Self time inside the launch window only — pre-main plus pre-first-frame.
+    ///
+    /// This, not `selfMilliseconds`, is what a launch budget is denominated in.
+    /// `selfMilliseconds` spans the whole trace including post-first-frame work, and
+    /// comparing that against a time-to-first-frame total mixes two different windows:
+    /// a module whose *deferred* work got slower would fail the gate even though the
+    /// user-visible launch did not move at all. That is exactly the false positive
+    /// that gets a launch gate switched off.
+    public var launchWindowSelfMilliseconds: Double {
+        selfMilliseconds(in: .preMain) + selfMilliseconds(in: .preFirstFrame)
+    }
 }
 
 /// A complete launch trace.
@@ -92,6 +104,27 @@ public struct LaunchTrace: Sendable, Equatable, Codable {
         // meaningless-but-nonzero and the caller can see something is wrong.
         self.sampleIntervalNanos = max(1, sampleIntervalNanos)
         self.samples = samples
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case label, sampleIntervalNanos, samples
+    }
+
+    /// Explicit decoding initialiser, delegating to the memberwise one.
+    ///
+    /// This is not boilerplate. Swift's *synthesised* `init(from:)` assigns stored
+    /// properties directly and never runs the clamping in the memberwise init — so a
+    /// trace file with `"sampleIntervalNanos": 0` would decode unclamped, every
+    /// duration would compute to zero, and the gate would pass everything silently.
+    /// Since decoding from JSON is the documented way to feed the gate in CI, that is
+    /// the *primary* path, not an edge case: the sanitisation has to survive it.
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(
+            label: try container.decode(String.self, forKey: .label),
+            sampleIntervalNanos: try container.decode(UInt64.self, forKey: .sampleIntervalNanos),
+            samples: try container.decode([LaunchSample].self, forKey: .samples)
+        )
     }
 
     private var millisecondsPerSample: Double {
@@ -175,6 +208,24 @@ public struct LaunchTrace: Sendable, Equatable, Codable {
             .sorted { lhs, rhs in
                 if lhs.selfMilliseconds != rhs.selfMilliseconds {
                     return lhs.selfMilliseconds > rhs.selfMilliseconds
+                }
+                return lhs.module.rawValue < rhs.module.rawValue
+            }
+    }
+
+    /// Attribution sorted by cost *inside the launch window* — the ordering that
+    /// answers "who is making launch slow".
+    ///
+    /// `rankedAttribution()` sorts by whole-trace self time, which is the right
+    /// ordering for a flamegraph and the wrong one for a budget: a module doing 9 ms
+    /// of deliberately-deferred post-first-frame work would outrank modules that
+    /// actually cost launch time. Same reasoning as `launchWindowSelfMilliseconds`.
+    public func rankedByLaunchWindow() -> [ModuleAttribution] {
+        attribution()
+            .values
+            .sorted { lhs, rhs in
+                if lhs.launchWindowSelfMilliseconds != rhs.launchWindowSelfMilliseconds {
+                    return lhs.launchWindowSelfMilliseconds > rhs.launchWindowSelfMilliseconds
                 }
                 return lhs.module.rawValue < rhs.module.rawValue
             }

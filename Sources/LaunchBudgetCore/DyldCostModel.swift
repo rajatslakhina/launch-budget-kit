@@ -97,6 +97,17 @@ public struct DyldCostModel: Sendable, Equatable {
     /// `+load` is deliberately *not* discounted: it is app code, and a faster loader
     /// does not make your own `+load` body run faster. That asymmetry is the whole
     /// argument for why iOS 27 does not retire this budget system.
+    ///
+    /// A caveat worth stating rather than hiding: composing these three per-term
+    /// ratios over a graph like `SampleWorkspace`'s produces roughly a **50%**
+    /// predicted pre-main improvement, which is far more than the ~21-23% *end-to-end*
+    /// figure the ratios were sourced alongside. Both can be true — end-to-end launch
+    /// includes a large amount of app code that no loader improvement touches, while
+    /// this model covers only the loader-attributable portion — but it means the
+    /// number this model produces is emphatically **not** a prediction of what your
+    /// users will see. It is a comparison between two linkage plans under one fixed
+    /// set of assumptions. `LaunchBudgetCoreTests` pins the composed ratio so that
+    /// this gap stays visible instead of drifting silently.
     public static let iOS27 = DyldCostModel(
         name: "iOS 27",
         fixedOverheadMilliseconds: iOS26.fixedOverheadMilliseconds / 1.5,

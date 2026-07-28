@@ -61,6 +61,16 @@ public struct WorkItemID: Hashable, Codable, Sendable, CustomStringConvertible, 
     public init(_ rawValue: String) { self.rawValue = rawValue }
     public init(stringLiteral value: StringLiteralType) { self.rawValue = value }
     public var description: String { rawValue }
+
+    // Single-value coding, for the same reason as `ModuleID`.
+    public init(from decoder: Decoder) throws {
+        self.rawValue = try decoder.singleValueContainer().decode(String.self)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
 }
 
 /// One unit of startup work, owned by exactly one module.
@@ -253,12 +263,19 @@ public struct StartupSchedule: Sendable {
             var incumbent: Double = 0
             var incumbentPredecessor: WorkItemID?
 
-            for dependency in item.dependencies {
+            // Sorted so that ties resolve to the same predecessor on every run.
+            for dependency in item.dependencies.sorted(by: { $0.rawValue < $1.rawValue }) {
                 // Dependencies outside the blocking set contribute nothing to
                 // time-to-first-frame; the phase-inversion invariant guarantees they
                 // cannot be *later*-phase items, so skipping them here is safe.
                 guard let candidate = best[dependency] else { continue }
-                if candidate > incumbent {
+                // `incumbentPredecessor == nil` is load-bearing, not defensive: a
+                // dependency whose accumulated length is exactly 0 (a zero-duration
+                // root, or a NaN duration normalised to 0 at construction) would never
+                // beat the initial `incumbent` of 0 under a bare `>`, so it would be
+                // dropped from the reconstructed path — and the reported item count
+                // would silently disagree with the reported duration.
+                if incumbentPredecessor == nil || candidate > incumbent {
                     incumbent = candidate
                     incumbentPredecessor = dependency
                 }

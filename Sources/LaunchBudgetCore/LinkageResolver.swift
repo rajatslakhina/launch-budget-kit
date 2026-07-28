@@ -148,18 +148,20 @@ public struct LinkageResolver: Sendable {
 
     /// Resolve the graph.
     ///
-    /// Five passes, each linear in the size of the graph:
+    /// Four sweeps, O(V + E + |answer|) in total:
     ///
     /// 1. Seed every module with its declared linkage.
-    /// 2. Merge eligibility, in **reverse** topological order — dependents before
-    ///    dependencies — so that a denied merge cascades to everything the denied
-    ///    module depends on in a single pass.
-    /// 3. Static duplication, which reads the linkage resolved in pass 2.
-    /// 4. Unconditional pre-main work in modules that claim to be off the launch path.
-    /// 5. The graph-wide dynamic-image ceiling.
+    /// 2. One **reverse** topological sweep — dependents before dependencies — that
+    ///    simultaneously memoises, for every module, the set of dynamic images
+    ///    physically containing its code, and uses that to decide merge eligibility.
+    ///    Merge denial cascades correctly in this single pass.
+    /// 3. Static duplication, reading the same memo, so it cannot disagree with 2.
+    /// 4. Unconditional pre-main work in modules that claim to be off the launch path,
+    ///    then the graph-wide dynamic-image ceiling.
     ///
-    /// Passes 2 and 3 both look at *dependents*, not dependencies, which is why the
-    /// iteration order is the reverse of the one a build system would use.
+    /// Steps 2 and 3 look at *dependents*, not dependencies, which is why the
+    /// iteration order is the reverse of the one a build system would use — and why
+    /// `ModuleGraph` maintains a reverse-adjacency index.
     public func resolve(_ graph: ModuleGraph) -> LinkagePlan {
         var effective: [ModuleID: LinkagePolicy] = [:]
         var diagnostics: [LinkageDiagnostic] = []
@@ -172,33 +174,57 @@ public struct LinkageResolver: Sendable {
             effective[descriptor.id] = descriptor.declaredLinkage
         }
 
-        // Pass 2 — merge eligibility.
+        // Passes 2 and 3 — merge eligibility and static duplication, in one walk.
         //
-        // Rule: a mergeable module can merge into the host only if no *dynamic* image
-        // other than the host also links it. If a dynamic framework links it, merging
-        // it into the host would either duplicate it into both or leave the dynamic
-        // framework with an unresolved symbol — so the linker keeps it dynamic.
+        // Both questions have the same shape: "which dynamic images physically contain
+        // this module's code?" A static (or successfully merged) module is transparent
+        // to that question, because its objects are copied into whatever links it —
+        // so `Icons(mergeable) ← Utils(static) ← Feature(dynamic)` means `Feature`
+        // contains `Icons`, even though `Icons`' only direct dependent is static.
         //
-        // Iteration order matters and is deliberately **reverse** topological
-        // (dependents before dependencies). Merge denial cascades downward: if a
-        // mergeable module is demoted to dynamic, every mergeable module *it* depends
-        // on is now linked by a dynamic image and must be demoted too. Visiting
-        // dependents first means each module sees its dependents already resolved, so
-        // one pass reaches the fixed point instead of needing to iterate to
-        // convergence.
-        for descriptor in graph.orderedDescriptors.reversed() where descriptor.declaredLinkage == .mergeable {
-            let dependents = graph.dependents(of: descriptor.id)
-            let dynamicDependents = dependents.filter { dependent in
-                // Already-resolved, thanks to the reverse iteration order above: a
-                // dependent that successfully merged reads as `.staticLibrary` here
-                // and correctly does not block this module's merge.
-                effective[dependent] == .dynamicFramework
-            }
+        // Iteration order is **reverse** topological — dependents before dependencies.
+        // That does two things at once:
+        //
+        //   1. Merge denial cascades correctly in a single pass. Demoting a mergeable
+        //      module to dynamic makes every mergeable module it depends on newly
+        //      blocked; visiting dependents first means each module reads its
+        //      dependents' *final* linkage, so no iteration-to-convergence is needed.
+        //   2. It lets the transitive answer be memoised. `dynamicDependents[m]` is
+        //      assembled from entries already computed for m's dependents, so the whole
+        //      thing is one O(V + E + |answer|) sweep rather than a fresh graph walk
+        //      per module. The un-memoised version was Θ(V²) on a deep chain and took
+        //      3 seconds on 2,000 modules; this takes milliseconds.
+        var dynamicDependents: [ModuleID: Set<ModuleID>] = [:]
+        dynamicDependents.reserveCapacity(graph.count)
 
-            if !dynamicDependents.isEmpty {
+        for descriptor in graph.orderedDescriptors.reversed() {
+            var reachable: Set<ModuleID> = []
+            for dependent in graph.dependents(of: descriptor.id) {
+                if effective[dependent] == .dynamicFramework {
+                    // A dynamic image is a real linkage boundary — stop here.
+                    reachable.insert(dependent)
+                } else {
+                    // Transparent: this module's code travels onward into whatever
+                    // links its dependent. Already computed, by reverse-topo order.
+                    reachable.formUnion(dynamicDependents[dependent] ?? [])
+                }
+            }
+            // NOTE: for a module that is itself dynamic, this entry means "images
+            // containing it, excluding itself" and is NOT a valid general answer. It
+            // is never read as one — every read above is gated on the dependent not
+            // being dynamic — but the invariant is worth stating rather than leaving
+            // for a future pass to trip over.
+            dynamicDependents[descriptor.id] = reachable
+
+            guard descriptor.declaredLinkage == .mergeable else { continue }
+
+            if reachable.isEmpty {
+                // Merged: behaves like a static library at runtime.
+                effective[descriptor.id] = .staticLibrary
+            } else {
                 effective[descriptor.id] = .dynamicFramework
                 overridden.insert(descriptor.id)
-                let blockers = dynamicDependents.sorted { $0.rawValue < $1.rawValue }
+                let blockers = reachable.sorted { $0.rawValue < $1.rawValue }
                 diagnostics.append(
                     LinkageDiagnostic(
                         module: descriptor.id,
@@ -209,36 +235,28 @@ public struct LinkageResolver: Sendable {
                             + " — falls back to a separate dynamic image, so it still pays per-image load cost."
                     )
                 )
-            } else {
-                // Merged: behaves like a static library at runtime.
-                effective[descriptor.id] = .staticLibrary
             }
         }
 
-        // Pass 3 — static duplication.
-        //
-        // A static module linked by N dynamic images is copied N times. Nobody's
-        // declared setting is wrong; the graph shape is. This is the diagnostic that
-        // catches "we made everything static to cut image count and the binary
-        // doubled".
+        // Static duplication, reading the same memo — which is what guarantees the two
+        // diagnostics cannot disagree about what "static" means. A static module
+        // reachable from N dynamic images is physically copied N times; nobody's
+        // declared setting is wrong, the graph shape is. This is what catches "we made
+        // everything static to cut image count and the binary doubled".
         for descriptor in graph.orderedDescriptors where effective[descriptor.id] == .staticLibrary {
-            let dynamicDependents = graph.dependents(of: descriptor.id).filter {
-                effective[$0] == .dynamicFramework
-            }
-            if dynamicDependents.count >= rules.staticDuplicationThreshold {
-                let into = dynamicDependents.sorted { $0.rawValue < $1.rawValue }
-                diagnostics.append(
-                    LinkageDiagnostic(
-                        module: descriptor.id,
-                        kind: .staticDuplication(copies: into.count, into: into),
-                        severity: .warning,
-                        message: "static, but linked by \(into.count) dynamic images "
-                            + "(\(into.map(\.rawValue).joined(separator: ", "))) — "
-                            + "the code is duplicated into each. Consider making it dynamic, "
-                            + "or making its dependents mergeable."
-                    )
+            let into = (dynamicDependents[descriptor.id] ?? []).sorted { $0.rawValue < $1.rawValue }
+            guard into.count >= rules.staticDuplicationThreshold else { continue }
+            diagnostics.append(
+                LinkageDiagnostic(
+                    module: descriptor.id,
+                    kind: .staticDuplication(copies: into.count, into: into),
+                    severity: .warning,
+                    message: "static, but linked by \(into.count) dynamic images "
+                        + "(\(into.map(\.rawValue).joined(separator: ", "))) — "
+                        + "the code is duplicated into each. Consider making it dynamic, "
+                        + "or making its dependents mergeable."
                 )
-            }
+            )
         }
 
         // Pass 4 — unconditional work in modules that claim not to touch launch.
@@ -290,9 +308,15 @@ public struct LinkageResolver: Sendable {
 
         return LinkagePlan(
             effectiveLinkage: effective,
+            // Severity, then module, then message. The third key is not decoration:
+            // one module can raise two diagnostics of the same severity (Telemetry
+            // raises both `unconditionalWork` and `staticDuplication`), and without it
+            // their relative order is implementation-defined for any consumer reading
+            // `LinkagePlan.diagnostics` directly rather than via `GateReport`.
             diagnostics: diagnostics.sorted { lhs, rhs in
                 if lhs.severity != rhs.severity { return lhs.severity > rhs.severity }
-                return lhs.module.rawValue < rhs.module.rawValue
+                if lhs.module.rawValue != rhs.module.rawValue { return lhs.module.rawValue < rhs.module.rawValue }
+                return lhs.message < rhs.message
             },
             overriddenModules: overridden,
             dynamicImageCount: dynamicCount,

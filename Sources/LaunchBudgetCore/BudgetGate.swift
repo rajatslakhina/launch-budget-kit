@@ -119,6 +119,13 @@ public struct GateReport: Sendable, Equatable {
     public let predictedPreMain: PreMainCostEstimate
     public let criticalPath: CriticalPathAnalysis?
 
+    /// The linkage plan the gate resolved while evaluating.
+    ///
+    /// Exposed so a caller that wants to render the plan does not have to run the
+    /// resolver a second time on the same graph — which is exactly what the demo
+    /// dashboard was doing.
+    public let linkagePlan: LinkagePlan
+
     public var deltaMilliseconds: Double {
         candidateTimeToFirstFrameMs - baselineTimeToFirstFrameMs
     }
@@ -145,12 +152,12 @@ public struct GateReport: Sendable, Equatable {
                             candidateTimeToFirstFrameMs, deltaMilliseconds, deltaPercent * 100))
         lines.append("  predicted pre-main: \(Milliseconds.format(predictedPreMain.totalMilliseconds)) ms"
                      + " via \(predictedPreMain.modelName) [\(predictedPreMain.provenance.rawValue)]")
-        lines.append(String(format: "    └ %d dynamic images → %.1f ms (%.0f%% of pre-main)",
+        lines.append(String(format: "    └ %ld dynamic images → %.1f ms (%.0f%% of pre-main)",
                             predictedPreMain.dynamicImageCount,
                             predictedPreMain.dynamicImageMilliseconds,
                             predictedPreMain.linkageAttributableShare * 100))
         if let criticalPath {
-            lines.append(String(format: "  critical path : %.1f ms over %d items (serial would be %.1f ms)",
+            lines.append(String(format: "  critical path : %.1f ms over %ld items (serial would be %.1f ms)",
                                 criticalPath.durationMilliseconds,
                                 criticalPath.path.count,
                                 criticalPath.serialMilliseconds))
@@ -220,19 +227,23 @@ public struct BudgetGate: Sendable {
         // 2. Trace quality. Attribution over a mostly-unsymbolicated trace produces
         // confident-looking numbers about nothing, so check this before using any of
         // them.
-        let unattributedShare = candidate.samples.isEmpty
-            ? 0
-            : Double(candidate.unattributedSampleCount) / Double(candidate.samples.count)
-        if unattributedShare > 0.2 {
+        // Checked on BOTH traces, not just the candidate: per-module deltas are a
+        // difference of two attributions, so an unsymbolicated *baseline* poisons every
+        // delta just as thoroughly, and does it while looking like an improvement.
+        for (label, trace) in [("baseline", baseline), ("candidate", candidate)] {
+            let share = trace.samples.isEmpty
+                ? 0
+                : Double(trace.unattributedSampleCount) / Double(trace.samples.count)
+            guard share > 0.2 else { continue }
             findings.append(
                 GateFinding(
-                    kind: .lowTraceQuality(unattributedShare: unattributedShare),
+                    kind: .lowTraceQuality(unattributedShare: share),
                     severity: .error,
                     message: String(
-                        format: "trace quality — %.0f%% of candidate samples have no resolvable frames; "
-                            + "attribution below is not trustworthy. Check that dSYMs were available to the profiler.",
-                        unattributedShare * 100
-                    )
+                        format: "trace quality — %.0f%% of ",
+                        share * 100
+                    ) + label + " samples have no resolvable frames; attribution below is not "
+                        + "trustworthy. Check that dSYMs were available to the profiler."
                 )
             )
         }
@@ -267,9 +278,15 @@ public struct BudgetGate: Sendable {
         let allModules = Set(baselineAttribution.keys).union(candidateAttribution.keys)
 
         for module in allModules.sorted(by: { $0.rawValue < $1.rawValue }) {
-            let baseSelf = baselineAttribution[module]?.selfMilliseconds ?? 0
+            // `launchWindowSelfMilliseconds`, deliberately, not `selfMilliseconds`.
+            // The totals above are time-to-first-frame; charging a module for its
+            // post-first-frame work here would compare two different windows, and a
+            // module whose *deferred* work got slower would fail a build in which
+            // time-to-first-frame never moved. That false positive is precisely how a
+            // launch gate earns a reputation for crying wolf and gets switched off.
+            let baseSelf = baselineAttribution[module]?.launchWindowSelfMilliseconds ?? 0
             let candidateEntry = candidateAttribution[module]
-            let candidateSelf = candidateEntry?.selfMilliseconds ?? 0
+            let candidateSelf = candidateEntry?.launchWindowSelfMilliseconds ?? 0
             let delta = candidateSelf - baseSelf
 
             // Undeclared module: in the trace, not in the manifest.
@@ -280,13 +297,17 @@ public struct BudgetGate: Sendable {
             // case, and folding it in would let an unowned dependency explain away
             // the very regression it caused.
             if let candidateEntry, graph.descriptor(for: module) == nil {
-                if policy.requireBudgetForEveryModule {
+                // Only worth reporting if it actually costs launch time. A module that
+                // appears solely in post-first-frame samples is outside the budget's
+                // scope, and failing a build over it would be the same window-mixing
+                // mistake as above.
+                if policy.requireBudgetForEveryModule, candidateEntry.launchWindowSelfMilliseconds > 0 {
                     findings.append(
                         GateFinding(
-                            kind: .undeclaredModule(module: module, observedMs: candidateEntry.selfMilliseconds),
+                            kind: .undeclaredModule(module: module, observedMs: candidateEntry.launchWindowSelfMilliseconds),
                             severity: .error,
                             message: "\(module.rawValue) consumed "
-                                + "\(Milliseconds.format(candidateEntry.selfMilliseconds)) ms of launch but has no "
+                                + "\(Milliseconds.format(candidateEntry.launchWindowSelfMilliseconds)) ms of launch but has no "
                                 + "declared budget. Add it to the manifest with an explicit budget — unbudgeted "
                                 + "modules are how a launch budget quietly stops covering the app."
                         )
@@ -424,7 +445,8 @@ public struct BudgetGate: Sendable {
             baselineTimeToFirstFrameMs: baselineTTFF,
             candidateTimeToFirstFrameMs: candidateTTFF,
             predictedPreMain: estimate,
-            criticalPath: schedule?.criticalPath()
+            criticalPath: schedule?.criticalPath(),
+            linkagePlan: plan
         )
     }
 }
