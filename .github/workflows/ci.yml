@@ -1,0 +1,76 @@
+name: CI
+
+# A launch budget is only real if CI enforces it. Shipping a library that argues that,
+# with no CI of its own, would be a slightly embarrassing thing to leave for a reviewer
+# to notice.
+#
+# Three jobs, because this package has three genuinely different verification surfaces
+# and only one of them is the obvious one:
+#
+#   linux  — LaunchBudgetCore has no dependency beyond Foundation, so it can be built
+#            and tested in a plain container, exactly the way a real CI gate step would
+#            run it. This is where the 117 tests run.
+#   macos  — type-checks LaunchBudgetKitUI at all. On Linux that target compiles to an
+#            EMPTY MODULE (`#if canImport(SwiftUI)`), so the Linux job says nothing
+#            whatsoever about the SwiftUI sources.
+#   ios    — type-checks the `#if os(iOS)` regions, which the macOS job also skips.
+#            Without this job the only platform this library actually ships on would
+#            never be compiled by anything.
+#
+# Status at the time of writing: none of these jobs has executed yet. They are being
+# added in the same change that adds this file.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  linux:
+    name: Linux — build + test (LaunchBudgetCore)
+    runs-on: ubuntu-latest
+    container: swift:6.0
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build (debug)
+        run: swift build -v
+      - name: Build (release)
+        run: swift build -c release
+      - name: Test
+        run: swift test
+
+  macos:
+    name: macOS — build + test (type-checks the SwiftUI target)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          # swift-tools-version: 6.0 needs Xcode 16+, and the runner image's default
+          # Xcode is not pinned across image updates.
+          xcode-version: '16.2'
+      - name: Build all targets
+        run: swift build
+      - name: Test
+        run: swift test
+
+  ios:
+    name: "iOS SDK — build (type-checks the #if os(iOS) regions)"
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '16.2'
+      - name: Build for the iOS Simulator SDK
+        # No pretty-printer in the pipeline, deliberately. GitHub's default shell is
+        # `bash -e` WITHOUT `pipefail`, so `xcodebuild | xcpretty` reports xcpretty's
+        # exit status — and xcpretty frequently exits 0 on a failed build. This is the
+        # only job that ever compiles the `#if os(iOS)` code, so a silently green
+        # failure here would be the most expensive bug in the repo.
+        run: |
+          xcodebuild build \
+            -scheme LaunchBudgetKitUI \
+            -destination 'generic/platform=iOS Simulator' \
+            -skipPackagePluginValidation
